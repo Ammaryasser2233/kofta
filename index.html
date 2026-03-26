@@ -4376,9 +4376,10 @@
                 <th>الوقت</th>
                 <th>نوع الطلب</th>
                 <th>طريقة الدفع</th>
-                <th>عدد المنتجات</th>
+                <th>المنتجات</th>
+                <th>عددالمنتجات</th>
                 <th>الإجمالي</th>
-                <th>طباعة</th>
+                <th>الإجراءات</th>
               </tr>
             </thead>
             <tbody id="cashierReportTableBody">
@@ -6589,6 +6590,12 @@
       let holdInvoicesVisible = false;
 
       let isGroupedByCategory = false;
+
+      // ========== هذه هي المتغيرات التي تسبب المشكلة ==========
+      let dbManager;
+      let syncManager;
+      let invoiceManager;
+
       // ==================== دوال المصادقة ====================
       function setRole(role) {
         currentRole = role;
@@ -7432,7 +7439,6 @@
 
           // ========== حالة التوصيل ==========
           if (currentOrderType === "delivery") {
-            // دالة تنظيف الكائن من undefined
             const sanitizeObject = (obj) => {
               const result = {};
               for (const [key, value] of Object.entries(obj)) {
@@ -7448,7 +7454,6 @@
               deliveryPersonnelName: "",
               deliveryPaymentMethod: selectedPaymentMethod,
               syncStatus: "pending",
-              // ضمان وجود قيم افتراضية
               deliveryZone: invoiceData.deliveryZone || "",
               deliveryPrice: invoiceData.deliveryPrice || 0,
               deliveryNumber: invoiceData.deliveryNumber || "",
@@ -7457,13 +7462,19 @@
               orderNotes: invoiceData.orderNotes || "",
             };
 
-            // تنظيف الكائن من undefined قبل الحفظ
             const cleanedDeliveryOrder = sanitizeObject(deliveryOrder);
 
-            // 1. حفظ محلياً في IndexedDB
-            if (dbManager) {
+            // 1. حفظ محلياً في SQLite (أولاً)
+            if (dbManager && dbManager.isReady) {
               await dbManager.addDeliveryOrder(cleanedDeliveryOrder);
-              console.log("💾 تم حفظ التوصيل محلياً:", cleanedDeliveryOrder.id);
+              console.log(
+                "💾 تم حفظ طلب التوصيل في SQLite:",
+                cleanedDeliveryOrder.id,
+              );
+            } else {
+              console.warn(
+                "⚠️ dbManager غير جاهز، لن يتم حفظ طلب التوصيل محلياً",
+              );
             }
 
             // 2. إضافة إلى المصفوفة العامة وتحديثها فوراً
@@ -7528,7 +7539,7 @@
 
           // ========== باقي أنواع الطلبات (صالة، تيك أوت، استلام) ==========
           else {
-            // 1. حفظ في Firebase مباشرة مع تحديث الحالة
+            // 1. حفظ في Firebase مباشرة (مع تحديث الحالة)
             if (navigator.onLine && db) {
               try {
                 const syncedData = {
@@ -7552,9 +7563,12 @@
               }
             }
 
-            // 2. حفظ محلياً في IndexedDB
-            if (dbManager && invoiceManager) {
+            // 2. حفظ محلياً في SQLite
+            if (dbManager && invoiceManager && dbManager.isReady) {
               await invoiceManager.saveInvoice(invoiceData);
+              console.log("💾 تم حفظ الفاتورة في SQLite:", invoiceData.id);
+            } else {
+              console.warn("⚠️ dbManager غير جاهز، لن يتم حفظ الفاتورة محلياً");
             }
 
             // 3. تحديث مصفوفة sales فوراً
@@ -7605,262 +7619,225 @@
         }
       }
 
-      // ==================== إعدادات قاعدة البيانات المحلية ====================
-      const DB_CONFIG = {
-        name: "KoftaPOS_Database",
-        version: 2,
-        stores: {
-          invoices: "invoices", // الفواتير
-          pendingOps: "pendingOps", // العمليات المعلقة
-          deliveryOrders: "deliveryOrders", // ⬅️ جديد: مخزن طلبات التوصيل
-        },
-      };
+      // ==================== مدير قاعدة البيانات SQLit ====================
+      const { ipcRenderer } = require("electron");
+      const path = require("path");
+      const fs = require("fs");
 
-      // ==================== مدير قاعدة البيانات IndexedDB ====================
-      class IndexedDBManager {
+      class SQLiteManager {
         constructor() {
           this.db = null;
+          const userDataPath =
+            process.env.APPDATA ||
+            (process.platform == "darwin"
+              ? process.env.HOME + "/Library/Preferences"
+              : process.env.HOME + "/.local/share");
+          const appDir = path.join(userDataPath, "KoftaPOS");
+          if (!fs.existsSync(appDir)) {
+            fs.mkdirSync(appDir, { recursive: true });
+          }
+          this.dbPath = path.join(appDir, "kofta.db");
           this.isReady = false;
         }
 
         async init() {
           return new Promise((resolve, reject) => {
-            const request = indexedDB.open(DB_CONFIG.name, DB_CONFIG.version);
-
-            request.onerror = () => {
-              console.error("❌ فشل فتح IndexedDB:", request.error);
-              reject(request.error);
-            };
-
-            request.onsuccess = () => {
-              this.db = request.result;
+            try {
+              this.db = new Database(this.dbPath);
+              this.createTables();
               this.isReady = true;
-              console.log("✅ تم فتح IndexedDB بنجاح");
               resolve(this.db);
-            };
-
-            request.onupgradeneeded = (event) => {
-              const db = event.target.result;
-
-              // إنشاء مخزن الفواتير
-              if (!db.objectStoreNames.contains(DB_CONFIG.stores.invoices)) {
-                const invoiceStore = db.createObjectStore(
-                  DB_CONFIG.stores.invoices,
-                  { keyPath: "id" },
-                );
-                invoiceStore.createIndex("status", "status", { unique: false });
-                invoiceStore.createIndex("timestamp", "timestamp", {
-                  unique: false,
-                });
-              }
-
-              // إنشاء مخزن العمليات المعلقة
-              if (!db.objectStoreNames.contains(DB_CONFIG.stores.pendingOps)) {
-                const pendingStore = db.createObjectStore(
-                  DB_CONFIG.stores.pendingOps,
-                  { keyPath: "id" },
-                );
-                pendingStore.createIndex("type", "type", { unique: false });
-              }
-
-              // ⬇️ جديد: إنشاء مخزن طلبات التوصيل
-              if (
-                !db.objectStoreNames.contains(DB_CONFIG.stores.deliveryOrders)
-              ) {
-                const deliveryStore = db.createObjectStore(
-                  DB_CONFIG.stores.deliveryOrders,
-                  { keyPath: "id" },
-                );
-                deliveryStore.createIndex("status", "status", {
-                  unique: false,
-                });
-                deliveryStore.createIndex("timestamp", "date", {
-                  unique: false,
-                });
-                console.log("📦 تم إنشاء مخزن طلبات التوصيل");
-              }
-            };
+            } catch (err) {
+              console.error("❌ فشل فتح SQLite:", err);
+              reject(err);
+            }
           });
         }
 
-        async countPendingInvoices() {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readonly",
+        createTables() {
+          this.db.exec(`
+            CREATE TABLE IF NOT EXISTS invoices (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const index = store.index("status");
-            const request = index.count("pending");
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-          });
+            CREATE TABLE IF NOT EXISTS delivery_orders (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS pending_ops (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
         }
 
-        // --- دوال الفواتير (كما كانت) ---
-        async addInvoice(invoice) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readwrite",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const request = store.add({
-              ...invoice,
-              savedLocallyAt: new Date().toISOString(),
-            });
-            request.onsuccess = () => resolve(invoice);
-            request.onerror = () => reject(request.error);
-          });
-        }
-        async updateInvoice(invoice) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readwrite",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const request = store.put(invoice);
-            request.onsuccess = () => resolve(invoice);
-            request.onerror = () => reject(request.error);
-          });
-        }
-        async getInvoice(id) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readonly",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const request = store.get(id);
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-          });
-        }
-        async getPendingInvoices() {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readonly",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const index = store.index("status");
-            const request = index.getAll("pending");
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-          });
-        }
-        async getAllInvoices() {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readonly",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const request = store.getAll();
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-          });
-        }
-        async deleteInvoice(id) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.invoices],
-              "readwrite",
-            );
-            const store = transaction.objectStore(DB_CONFIG.stores.invoices);
-            const request = store.delete(id);
-            request.onsuccess = () => resolve(true);
-            request.onerror = () => reject(request.error);
-          });
+        // --- دوال الفواتير ---
+        addInvoice(invoice) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(`
+            INSERT OR REPLACE INTO invoices (id, data, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        `);
+          const now = new Date().toISOString();
+          stmt.run(
+            invoice.id,
+            JSON.stringify(invoice),
+            invoice.status || "pending",
+            invoice.createdAt || now,
+            now,
+          );
+          return invoice;
         }
 
-        // ⬇️ جديد: دوال طلبات التوصيل
-        async addDeliveryOrder(order) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.deliveryOrders],
-              "readwrite",
-            );
-            const store = transaction.objectStore(
-              DB_CONFIG.stores.deliveryOrders,
-            );
-            // تنظيف البيانات من undefined
-            const cleanedOrder = Object.keys(order).reduce((acc, key) => {
-              if (order[key] !== undefined) {
-                acc[key] = order[key];
-              }
-              return acc;
-            }, {});
-            const request = store.add({
-              ...cleanedOrder,
-              savedLocallyAt: new Date().toISOString(),
-              syncStatus: "pending",
-            });
-            request.onsuccess = () => {
-              console.log("🚚 تم حفظ طلب التوصيل محلياً:", order.id);
-              resolve(order);
-            };
-            request.onerror = () => reject(request.error);
-          });
+        updateInvoice(invoice) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(`
+            UPDATE invoices
+            SET data = ?, status = ?, updated_at = ?
+            WHERE id = ?
+        `);
+          stmt.run(
+            JSON.stringify(invoice),
+            invoice.status,
+            new Date().toISOString(),
+            invoice.id,
+          );
+          return invoice;
         }
 
-        async updateDeliveryOrder(order) {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.deliveryOrders],
-              "readwrite",
-            );
-            const store = transaction.objectStore(
-              DB_CONFIG.stores.deliveryOrders,
-            );
-            // نحدث الحالة لتكون pending لإعادة المزامنة
-            const request = store.put({
-              ...order,
-              syncStatus: "pending",
-              lastUpdated: new Date().toISOString(),
-            });
-            request.onsuccess = () => resolve(order);
-            request.onerror = () => reject(request.error);
-          });
+        getInvoice(id) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(
+            "SELECT data FROM invoices WHERE id = ?",
+          );
+          const row = stmt.get(id);
+          return row ? JSON.parse(row.data) : null;
         }
 
-        async getAllDeliveryOrders() {
-          if (!this.isReady) await this.init();
-          return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(
-              [DB_CONFIG.stores.deliveryOrders],
-              "readonly",
-            );
-            const store = transaction.objectStore(
-              DB_CONFIG.stores.deliveryOrders,
-            );
-            const request = store.getAll();
-            request.onsuccess = () => resolve(request.result);
-            request.onerror = () => reject(request.error);
-          });
+        getAllInvoices() {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare("SELECT data FROM invoices");
+          const rows = stmt.all();
+          return rows.map((r) => JSON.parse(r.data));
         }
 
-        async getPendingDeliveryOrders() {
-          if (!this.isReady) await this.init();
-          // سنقوم ببساطة بجلب كل الطلبات ذات syncStatus = pending (يمكن استخدام Index لاحقاً للأداء)
-          const all = await this.getAllDeliveryOrders();
-          return all.filter((o) => o.syncStatus === "pending");
+        getPendingInvoices() {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(
+            "SELECT data FROM invoices WHERE status = ?",
+          );
+          const rows = stmt.all("pending");
+          return rows.map((r) => JSON.parse(r.data));
+        }
+
+        deleteInvoice(id) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare("DELETE FROM invoices WHERE id = ?");
+          const info = stmt.run(id);
+          return info.changes > 0;
+        }
+
+        countPendingInvoices() {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(
+            "SELECT COUNT(*) as cnt FROM invoices WHERE status = ?",
+          );
+          const row = stmt.get("pending");
+          return row.cnt;
+        }
+
+        // --- دوال طلبات التوصيل ---
+        addDeliveryOrder(order) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(`
+            INSERT OR REPLACE INTO delivery_orders (id, data, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        `);
+          const now = new Date().toISOString();
+          stmt.run(
+            order.id,
+            JSON.stringify(order),
+            order.syncStatus || "pending",
+            order.createdAt || now,
+            now,
+          );
+          return order;
+        }
+
+        updateDeliveryOrder(order) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(`
+            UPDATE delivery_orders
+            SET data = ?, status = ?, updated_at = ?
+            WHERE id = ?
+        `);
+          stmt.run(
+            JSON.stringify(order),
+            order.syncStatus,
+            new Date().toISOString(),
+            order.id,
+          );
+          return order;
+        }
+
+        getAllDeliveryOrders() {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare("SELECT data FROM delivery_orders");
+          const rows = stmt.all();
+          return rows.map((r) => JSON.parse(r.data));
+        }
+
+        getPendingDeliveryOrders() {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(
+            "SELECT data FROM delivery_orders WHERE status = ?",
+          );
+          const rows = stmt.all("pending");
+          return rows.map((r) => JSON.parse(r.data));
+        }
+
+        // --- دوال العمليات المعلقة ---
+        addPendingOp(op) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(`
+            INSERT OR REPLACE INTO pending_ops (id, type, data, created_at)
+            VALUES (?, ?, ?, ?)
+        `);
+          stmt.run(
+            op.id,
+            op.type,
+            JSON.stringify(op.data),
+            new Date().toISOString(),
+          );
+          return op;
+        }
+
+        getPendingOpsByType(type) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare(
+            "SELECT data FROM pending_ops WHERE type = ?",
+          );
+          const rows = stmt.all(type);
+          return rows.map((r) => JSON.parse(r.data));
+        }
+
+        deletePendingOp(id) {
+          if (!this.isReady) throw new Error("SQLiteManager not ready");
+          const stmt = this.db.prepare("DELETE FROM pending_ops WHERE id = ?");
+          const info = stmt.run(id);
+          return info.changes > 0;
         }
       }
 
-      // ==================== مدير المزامنة ====================
-      // ==================== مدير المزامنة (معدل ومكتمل) ====================
-      class SyncManager {
+      class OfflineSyncManager {
         constructor(dbManager, firebaseDB) {
           this.dbManager = dbManager;
           this.firebaseDB = firebaseDB;
@@ -7869,17 +7846,16 @@
           this.maxRetries = 3;
         }
 
-        // تهيئة المزامنة
         async init() {
           const pendingInvoicesCount =
             await this.dbManager.countPendingInvoices();
           const pendingOrdersCount = (
             await this.dbManager.getPendingDeliveryOrders()
           ).length;
-
           if (pendingInvoicesCount > 0 || pendingOrdersCount > 0) {
-            const msg = `🔄 يوجد ${pendingInvoicesCount} فاتورة و ${pendingOrdersCount} طلب توصيل معلقة`;
-            console.log(msg);
+            console.log(
+              `🔄 يوجد ${pendingInvoicesCount} فاتورة و ${pendingOrdersCount} طلب توصيل معلقة`,
+            );
             this.showSyncNotification(
               pendingInvoicesCount + pendingOrdersCount,
             );
@@ -7887,16 +7863,9 @@
           this.setupNetworkListeners();
         }
 
-        // إعداد مراقبة الشبكة
         setupNetworkListeners() {
-          window.addEventListener("online", () => {
-            console.log("🌐 عاد الاتصال بالإنترنت");
-            this.onOnline();
-          });
-          window.addEventListener("offline", () => {
-            console.log("❌ انقطع الاتصال بالإنترنت");
-            this.onOffline();
-          });
+          window.addEventListener("online", () => this.onOnline());
+          window.addEventListener("offline", () => this.onOffline());
           if (typeof require === "function") {
             try {
               const { ipcRenderer } = require("electron");
@@ -7908,7 +7877,6 @@
           }
         }
 
-        // عند عودة الاتصال
         async onOnline() {
           showNotification("🌐 عاد الاتصال - جاري المزامنة...", "info");
           await Promise.all([
@@ -7918,7 +7886,6 @@
           await refreshSalesData();
         }
 
-        // عند انقطاع الاتصال
         onOffline() {
           showNotification(
             "⚠️ الوضع غير المتصل - البيانات تُحفظ محلياً",
@@ -7926,26 +7893,23 @@
           );
         }
 
-        // ======================= مزامنة الفواتير =======================
         async syncPendingInvoices() {
+          if (!this.dbManager || !this.dbManager.isReady) {
+            console.warn("⚠️ dbManager غير جاهز، تخطي مزامنة الفواتير");
+            return;
+          }
           try {
             const pendingInvoices = await this.dbManager.getPendingInvoices();
-            if (pendingInvoices.length === 0) {
-              console.log("✅ لا توجد فواتير معلقة");
-              return;
-            }
+            if (pendingInvoices.length === 0) return;
             console.log(`🔄 بدء مزامنة ${pendingInvoices.length} فاتورة...`);
-            const batchSize = 500;
-            const batches = this.chunkArray(pendingInvoices, batchSize);
-            let syncedCount = 0;
-            let failedCount = 0;
-
+            const batches = this.chunkArray(pendingInvoices, 500);
+            let syncedCount = 0,
+              failedCount = 0;
             for (const batch of batches) {
               const result = await this.syncBatch(batch, "sales");
               syncedCount += result.synced;
               failedCount += result.failed;
             }
-
             if (syncedCount > 0)
               showNotification(
                 `✅ تمت مزامنة ${syncedCount} فاتورة`,
@@ -7958,53 +7922,40 @@
           }
         }
 
-        // ======================= مزامنة طلبات التوصيل =======================
-        // ======================= مزامنة طلبات التوصيل =======================
         async syncPendingDeliveryOrders() {
+          if (!this.dbManager || !this.dbManager.isReady) {
+            console.warn("⚠️ dbManager غير جاهز، تخطي مزامنة طلبات التوصيل");
+            return;
+          }
           try {
             const pendingOrders =
               await this.dbManager.getPendingDeliveryOrders();
-            if (pendingOrders.length === 0) {
-              console.log("✅ لا توجد طلبات توصيل معلقة");
-              return;
-            }
+            if (pendingOrders.length === 0) return;
             console.log(`🚚 بدء مزامنة ${pendingOrders.length} طلب توصيل...`);
-            const batchSize = 500;
-            const batches = this.chunkArray(pendingOrders, batchSize);
+            const batches = this.chunkArray(pendingOrders, 500);
             let syncedCount = 0;
-
             for (const batch of batches) {
               const result = await this.syncBatch(batch, "delivery");
               syncedCount += result.synced;
             }
-
             if (syncedCount > 0) {
               showNotification(
                 `🚚 تمت مزامنة ${syncedCount} طلب توصيل`,
                 "success",
               );
-
-              // ✅ تحديث واجهة الكاشير إذا كان تبويب الدليفري مفتوحاً
-              const cashierDeliveryTab =
-                document.getElementById("cashierDeliveryTab");
               if (
-                cashierDeliveryTab &&
-                cashierDeliveryTab.classList.contains("active")
+                document
+                  .getElementById("cashierDeliveryTab")
+                  ?.classList.contains("active")
               ) {
-                if (typeof loadUserDeliveryOrders === "function") {
-                  await loadUserDeliveryOrders();
-                }
+                await loadUserDeliveryOrders();
               }
-
-              // ✅ تحديث واجهة المدير إذا كان تبويب إدارة الدليفري مفتوحاً
-              const adminDeliveryTab = document.getElementById("deliveryTab");
               if (
-                adminDeliveryTab &&
-                adminDeliveryTab.classList.contains("active")
+                document
+                  .getElementById("deliveryTab")
+                  ?.classList.contains("active")
               ) {
-                if (typeof loadAdminDeliveryOrders === "function") {
-                  await loadAdminDeliveryOrders();
-                }
+                await loadAdminDeliveryOrders();
               }
             }
           } catch (error) {
@@ -8012,20 +7963,15 @@
           }
         }
 
-        // ======================= دالة المزامنة العامة =======================
         async syncBatch(items, collectionName) {
           const batch = this.firebaseDB.batch();
-          const syncedIds = [];
 
+          // إعداد الدفعة
           items.forEach((item) => {
-            // تنظيف البيانات: إزالة أي حقل قيمته undefined
             const cleanedItem = Object.keys(item).reduce((acc, key) => {
-              if (item[key] !== undefined) {
-                acc[key] = item[key];
-              }
+              if (item[key] !== undefined) acc[key] = item[key];
               return acc;
             }, {});
-
             const ref = this.firebaseDB.collection(collectionName).doc(item.id);
             const dataToSave = {
               ...cleanedItem,
@@ -8037,7 +7983,11 @@
 
           try {
             await batch.commit();
+            console.log(
+              `✅ تم مزامنة دفعة ${collectionName} بنجاح (${items.length} عنصر)`,
+            );
 
+            // تحديث الحالة المحلية
             for (const item of items) {
               if (collectionName === "sales") {
                 await this.dbManager.updateInvoice({
@@ -8082,7 +8032,6 @@
                   });
                 }
               }
-              syncedIds.push(item.id);
             }
             return { synced: items.length, failed: 0 };
           } catch (error) {
@@ -8090,10 +8039,69 @@
             return { synced: 0, failed: items.length };
           }
         }
-        // ======================= مزامنة عنصر واحد فوري =======================
+
+        chunkArray(array, size) {
+          const chunks = [];
+          for (let i = 0; i < array.length; i += size)
+            chunks.push(array.slice(i, i + size));
+          return chunks;
+        }
+
+        showSyncNotification(count) {
+          showNotification(
+            `📦 يوجد ${count} عملية في انتظار المزامنة`,
+            "warning",
+          );
+        }
+      }
+      // ==================== تهيئة النظام ====================
+
+      class InvoiceManager {
+        constructor(dbManager, syncManager) {
+          this.dbManager = dbManager;
+          this.syncManager = syncManager;
+        }
+
+        generateUniqueId() {
+          const timestamp = Date.now().toString(36);
+          const randomStr = Math.random().toString(36).substring(2, 9);
+          const cashierId = (currentUser?.username || "unknown").substring(
+            0,
+            4,
+          );
+          return `INV_${timestamp}_${cashierId}_${randomStr}`.toUpperCase();
+        }
+
+        async saveInvoice(invoiceData) {
+          const invoice = {
+            id: invoiceData.id || this.generateUniqueId(),
+            ...invoiceData,
+            status: "pending",
+            createdAt: new Date().toISOString(),
+            createdBy: currentUser?.name || "unknown",
+            deviceInfo: this.getDeviceInfo(),
+          };
+
+          try {
+            await this.dbManager.addInvoice(invoice);
+            console.log("💾 تم حفظ الفاتورة محلياً بنجاح");
+
+            if (navigator.onLine) {
+              await this.syncSingleInvoice(invoice);
+            } else {
+              console.log("📱 الوضع غير متصل - ستُزامن لاحقاً");
+            }
+            return { success: true, invoice };
+          } catch (error) {
+            console.error("❌ فشل حفظ الفاتورة:", error);
+            this.saveToLocalStorageFallback(invoice);
+            return { success: false, error, invoice };
+          }
+        }
+
         async syncSingleInvoice(invoice) {
           try {
-            const ref = this.firebaseDB.collection("sales").doc(invoice.id);
+            const ref = db.collection("sales").doc(invoice.id);
             await ref.set({
               ...invoice,
               status: "synced",
@@ -8126,138 +8134,6 @@
           }
         }
 
-        async syncSingleDeliveryOrder(order) {
-          try {
-            const ref = this.firebaseDB.collection("delivery").doc(order.id);
-            await ref.set({
-              ...order,
-              syncStatus: "synced",
-              syncedAt: new Date().toISOString(),
-            });
-            await this.dbManager.updateDeliveryOrder({
-              ...order,
-              syncStatus: "synced",
-              syncedAt: new Date().toISOString(),
-            });
-            const dIndex = deliveryOrders.findIndex((d) => d.id === order.id);
-            if (dIndex !== -1) {
-              deliveryOrders[dIndex] = {
-                ...order,
-                syncStatus: "synced",
-                syncedAt: new Date().toISOString(),
-              };
-            } else {
-              deliveryOrders.push({
-                ...order,
-                syncStatus: "synced",
-                syncedAt: new Date().toISOString(),
-              });
-            }
-            console.log("✅ تمت المزامنة الفورية للتوصيل:", order.id);
-            return true;
-          } catch (error) {
-            console.warn("⚠️ فشلت المزامنة الفورية للتوصيل:", error);
-            return false;
-          }
-        }
-
-        // تقسيم المصفوفة إلى مجموعات
-        chunkArray(array, size) {
-          const chunks = [];
-          for (let i = 0; i < array.length; i += size) {
-            chunks.push(array.slice(i, i + size));
-          }
-          return chunks;
-        }
-
-        // إشعار المزامنة
-        showSyncNotification(count) {
-          showNotification(
-            `📦 يوجد ${count} عملية في انتظار المزامنة`,
-            "warning",
-          );
-        }
-      }
-
-      // ==================== مدير الفواتير ====================
-      class InvoiceManager {
-        constructor(dbManager, syncManager) {
-          this.dbManager = dbManager;
-          this.syncManager = syncManager;
-        }
-
-        // توليد معرف فريد
-        generateUniqueId() {
-          const timestamp = Date.now().toString(36);
-          const randomStr = Math.random().toString(36).substring(2, 9);
-          const cashierId = (currentUser?.username || "unknown").substring(
-            0,
-            4,
-          );
-          return `INV_${timestamp}_${cashierId}_${randomStr}`.toUpperCase();
-        }
-
-        // حفظ فاتورة جديدة
-        async saveInvoice(invoiceData) {
-          // 1. إنشاء كائن الفاتورة الكامل
-          const invoice = {
-            id: invoiceData.id || this.generateUniqueId(),
-            ...invoiceData,
-            status: "pending",
-            createdAt: new Date().toISOString(),
-            createdBy: currentUser?.name || "unknown",
-            deviceInfo: this.getDeviceInfo(),
-          };
-
-          try {
-            // 2. حفظ محلياً أولاً (الخطوة الأهم)
-            await this.dbManager.addInvoice(invoice);
-            console.log("💾 تم حفظ الفاتورة محلياً بنجاح");
-
-            // 3. محاولة المزامنة الفورية إذا كان متصلاً
-            if (navigator.onLine) {
-              await this.syncSingleInvoice(invoice);
-            } else {
-              console.log("📱 الوضع غير متصل - ستُزامن لاحقاً");
-            }
-
-            return { success: true, invoice };
-          } catch (error) {
-            console.error("❌ فشل حفظ الفاتورة:", error);
-
-            // محاولة حفظ في localStorage كحل أخير
-            this.saveToLocalStorageFallback(invoice);
-
-            return { success: false, error, invoice };
-          }
-        }
-
-        // مزامنة فاتورة واحدة
-        async syncSingleInvoice(invoice) {
-          try {
-            const ref = db.collection("sales").doc(invoice.id);
-            await ref.set({
-              ...invoice,
-              status: "synced",
-              syncedAt: new Date().toISOString(),
-            });
-
-            // تحديث الحالة محلياً
-            await this.dbManager.updateInvoice({
-              ...invoice,
-              status: "synced",
-              syncedAt: new Date().toISOString(),
-            });
-
-            console.log("✅ تمت المزامنة الفورية:", invoice.id);
-            return true;
-          } catch (error) {
-            console.warn("⚠️ فشلت المزامنة الفورية، ستُحاول لاحقاً:", error);
-            return false;
-          }
-        }
-
-        // حل أخير: localStorage
         saveToLocalStorageFallback(invoice) {
           try {
             const key = `kafta_fallback_invoice_${invoice.id}`;
@@ -8268,19 +8144,12 @@
           }
         }
 
-        // معلومات الجهاز
         getDeviceInfo() {
-          return {
-            device: typeof require === "function" ? "electron" : "web",
-          };
+          return { device: typeof require === "function" ? "electron" : "web" };
         }
 
-        // تحميل الفواتير للعرض
         async loadInvoices(filters = {}) {
-          // تحميل من المحلي أولاً
           const localInvoices = await this.dbManager.getAllInvoices();
-
-          // إذا كان متصلاً، جلب من Firebase ودمج
           if (navigator.onLine) {
             try {
               const firebaseInvoices = await this.loadFromFirebase(filters);
@@ -8290,33 +8159,22 @@
               return localInvoices;
             }
           }
-
           return localInvoices;
         }
 
-        // تحميل من Firebase
         async loadFromFirebase(filters = {}) {
           let query = db.collection("sales");
-
-          if (filters.startDate) {
+          if (filters.startDate)
             query = query.where("createdAt", ">=", filters.startDate);
-          }
-          if (filters.endDate) {
+          if (filters.endDate)
             query = query.where("createdAt", "<=", filters.endDate);
-          }
-
           const snapshot = await query.get();
           return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
         }
 
-        // دمج الفواتير (المحلية + السحابية)
         mergeInvoices(local, remote) {
           const merged = new Map();
-
-          // إضافة المحلية
           local.forEach((inv) => merged.set(inv.id, inv));
-
-          // إضافة/تحديث بالسحابية (السحابية أحدث عادة)
           remote.forEach((inv) => {
             const existing = merged.get(inv.id);
             if (
@@ -8326,41 +8184,109 @@
               merged.set(inv.id, inv);
             }
           });
-
           return Array.from(merged.values());
         }
       }
 
-      // ==================== تهيئة النظام ====================
-      let dbManager;
-      let syncManager;
-      let invoiceManager;
-
-      // دالة التهيئة الرئيسية
       async function initializeOfflineSystem() {
+        // التحقق من وجود ipcRenderer (إذا كنا في إلكترون)
+        if (!window.require) {
+          console.warn("⚠️ ليس في بيئة إلكترون، سيتم استخدام localStorage فقط");
+          return false;
+        }
+
         try {
-          dbManager = new IndexedDBManager();
-          await dbManager.init();
+          const { ipcRenderer } = window.require("electron");
+          window.ipcRenderer = ipcRenderer;
 
-          syncManager = new SyncManager(dbManager, db);
-          await syncManager.init();
+          // التحقق من الاتصال بالعملية الرئيسية (يجب أن يكون الـ handler معرفاً في main.js)
+          await ipcRenderer.invoke("db-ping");
 
+          // إذا وصلنا هنا، يمكننا إنشاء dbManager
+          dbManager = {
+            isReady: true,
+            async addInvoice(invoice) {
+              return await ipcRenderer.invoke("db-add-invoice", invoice);
+            },
+            async updateInvoice(invoice) {
+              return await ipcRenderer.invoke("db-update-invoice", invoice);
+            },
+            async getInvoice(id) {
+              return await ipcRenderer.invoke("db-get-invoice", id);
+            },
+            async getAllInvoices() {
+              return await ipcRenderer.invoke("db-get-all-invoices");
+            },
+            async getPendingInvoices() {
+              return await ipcRenderer.invoke("db-get-pending-invoices");
+            },
+            async deleteInvoice(id) {
+              return await ipcRenderer.invoke("db-delete-invoice", id);
+            },
+            async countPendingInvoices() {
+              return await ipcRenderer.invoke("db-count-pending-invoices");
+            },
+            async addDeliveryOrder(order) {
+              return await ipcRenderer.invoke("db-add-delivery-order", order);
+            },
+            async updateDeliveryOrder(order) {
+              return await ipcRenderer.invoke(
+                "db-update-delivery-order",
+                order,
+              );
+            },
+            async getAllDeliveryOrders() {
+              return await ipcRenderer.invoke("db-get-all-delivery-orders");
+            },
+            async getPendingDeliveryOrders() {
+              return await ipcRenderer.invoke("db-get-pending-delivery-orders");
+            },
+            async addPendingOp(op) {
+              return await ipcRenderer.invoke("db-add-pending-op", op);
+            },
+            async getPendingOpsByType(type) {
+              return await ipcRenderer.invoke(
+                "db-get-pending-ops-by-type",
+                type,
+              );
+            },
+            async deletePendingOp(id) {
+              return await ipcRenderer.invoke("db-delete-pending-op", id);
+            },
+          };
+
+          // تهيئة syncManager و invoiceManager
+          syncManager = new OfflineSyncManager(dbManager, db);
           invoiceManager = new InvoiceManager(dbManager, syncManager);
-          console.log("✅ تم تهيئة نظام Offline-First بنجاح");
+
           return true;
         } catch (error) {
           console.error("❌ فشل تهيئة النظام:", error);
+          dbManager = null;
+          syncManager = null;
+          invoiceManager = null;
           return false;
         }
       }
 
       async function refreshSalesData() {
-        if (!invoiceManager) return;
-        try {
-          const allInvoices = await invoiceManager.loadInvoices();
-          sales = allInvoices;
-          console.log(`📊 تم تحديث sales: ${sales.length} فاتورة`);
-
+        // إذا لم يتوفر invoiceManager، نستخدم البيانات من DataManager (السحابية أو المحفوظة في localStorage)
+        if (!invoiceManager) {
+          console.warn(
+            "⚠️ invoiceManager غير مهيأ، استخدام DataManager بدلاً منه",
+          );
+          try {
+            // محاولة تحميل البيانات من Firebase إذا كان متصلاً
+            if (navigator.onLine) {
+              sales = await DataManager.getSales();
+            } else {
+              // في وضع غير متصل، استخدم localStorage إن وجد
+              const saved = localStorage.getItem("kafta_sales_fallback");
+              if (saved) sales = JSON.parse(saved);
+            }
+          } catch (e) {
+            console.error("❌ فشل تحميل البيانات:", e);
+          }
           // تحديث الواجهة حسب الدور الحالي
           if (currentUser?.role === "cashier") {
             updateTodayStats();
@@ -8371,7 +8297,6 @@
             ) {
               loadCashierReport();
             }
-            // تحديث تبويب الدليفري إذا كان مفتوحاً
             if (
               document
                 .getElementById("cashierDeliveryTab")
@@ -8381,7 +8306,6 @@
             }
           } else if (currentUser?.role === "admin") {
             updateDashboard();
-            // تحديث الجداول المفتوحة فقط
             if (
               document.getElementById("salesTab")?.classList.contains("active")
             ) {
@@ -8394,23 +8318,50 @@
             ) {
               loadAdminDeliveryOrders();
             }
+          }
+          return;
+        }
+
+        // إذا كان invoiceManager متاحاً، نستخدمه للحصول على البيانات المدمجة
+        try {
+          const allInvoices = await invoiceManager.loadInvoices();
+          sales = allInvoices;
+          console.log(`📊 تم تحديث sales: ${sales.length} فاتورة`);
+
+          if (currentUser?.role === "cashier") {
+            updateTodayStats();
             if (
               document
-                .getElementById("productSalesTab")
+                .getElementById("cashierReportsTab")
                 ?.classList.contains("active")
             ) {
-              loadProductSales();
+              await loadCashierReport();
             }
             if (
               document
-                .getElementById("expensesTab")
+                .getElementById("cashierDeliveryTab")
                 ?.classList.contains("active")
             ) {
-              loadExpenses();
+              await loadUserDeliveryOrders();
+            }
+          } else if (currentUser?.role === "admin") {
+            updateDashboard();
+            if (
+              document.getElementById("salesTab")?.classList.contains("active")
+            ) {
+              await loadAdminSales();
+            }
+            if (
+              document
+                .getElementById("deliveryTab")
+                ?.classList.contains("active")
+            ) {
+              await loadAdminDeliveryOrders();
             }
           }
         } catch (error) {
           console.error("❌ فشل تحديث sales:", error);
+          showNotification("❌ حدث خطأ في تحديث البيانات", "error");
         }
       }
 
@@ -8835,27 +8786,27 @@
       }
 
       async function saveExpense() {
-        const amount = parseFloat(
-          document.getElementById("expenseModalAmount").value,
-        );
-        const description = document
-          .getElementById("expenseModalDescription")
-          .value.trim();
-
-        if (!amount || amount <= 0) {
-          showNotification("❌ يرجى إدخال مبلغ صحيح", "error");
-          return;
-        }
-
-        const expense = {
-          id: Date.now().toString(),
-          amount: amount,
-          description: description || "مصروف غير محدد",
-          date: new Date().toISOString(),
-          user: currentUser.name,
-        };
-
         try {
+          const amount = parseFloat(
+            document.getElementById("expenseModalAmount").value,
+          );
+          const description = document
+            .getElementById("expenseModalDescription")
+            .value.trim();
+
+          if (!amount || amount <= 0) {
+            showNotification("❌ يرجى إدخال مبلغ صحيح", "error");
+            return;
+          }
+
+          const expense = {
+            id: Date.now().toString(),
+            amount: amount,
+            description: description || "مصروف غير محدد",
+            date: new Date().toISOString(),
+            user: currentUser.name,
+          };
+
           expenses.push(expense);
           const result = await DataManager.saveExpenses(expenses);
 
@@ -8874,7 +8825,6 @@
           showNotification("❌ حدث خطأ في حفظ المصروف", "error");
         }
       }
-
       // ==================== دوال التقارير ====================
 
       async function loadCashierReport() {
@@ -9001,9 +8951,31 @@
 
       // دالة مساعدة: دمج البيانات المحلية والسحابية
       async function loadMergedDeliveryOrders() {
+        // إذا لم يكن dbManager جاهزاً، نحاول جلب البيانات من Firebase فقط (إذا كان متصلاً)
+        if (!dbManager || !dbManager.isReady) {
+          console.warn("⚠️ dbManager غير جاهز، استخدام Firebase فقط (إن أمكن)");
+          if (navigator.onLine) {
+            try {
+              const snapshot = await db.collection("delivery").get();
+              const orders = snapshot.docs.map((doc) => ({
+                id: doc.id,
+                ...doc.data(),
+              }));
+              console.log(
+                `📦 تم تحميل ${orders.length} طلب توصيل من Firebase (بدون محلي)`,
+              );
+              return orders;
+            } catch (e) {
+              console.error("❌ فشل تحميل طلبات التوصيل من Firebase:", e);
+              return [];
+            }
+          }
+          return [];
+        }
+
         try {
+          // 1. جلب الطلبات المحلية من SQLite
           const localOrders = await dbManager.getAllDeliveryOrders();
-          // تنظيف المحلية
           const cleanedLocal = localOrders.map((order) => {
             const cleaned = {};
             for (const [key, value] of Object.entries(order)) {
@@ -9012,6 +8984,7 @@
             return cleaned;
           });
 
+          // 2. جلب الطلبات من Firebase إذا كان متصلاً
           let remoteOrders = [];
           if (navigator.onLine) {
             try {
@@ -9025,10 +8998,14 @@
                 return { id: doc.id, ...cleaned };
               });
             } catch (e) {
-              console.warn("⚠️ فشل تحميل توصيلات السحابة:", e);
+              console.warn(
+                "⚠️ فشل تحميل توصيلات السحابة، سيتم استخدام المحلي فقط:",
+                e,
+              );
             }
           }
 
+          // 3. دمج البيانات: المحلي له الأولوية مع الأحدث
           const map = new Map();
           cleanedLocal.forEach((o) => map.set(o.id, o));
           remoteOrders.forEach((o) => {
@@ -9043,7 +9020,11 @@
             }
           });
 
-          return Array.from(map.values());
+          const merged = Array.from(map.values());
+          console.log(
+            `📦 تم دمج ${merged.length} طلب توصيل (محلي: ${cleanedLocal.length}, سحابي: ${remoteOrders.length})`,
+          );
+          return merged;
         } catch (error) {
           console.error("❌ خطأ في دمج بيانات التوصيل:", error);
           return [];
@@ -9144,6 +9125,10 @@
       }
 
       async function saveDeliveryPersonnelNameDirect(orderId, value) {
+        if (!dbManager || !dbManager.isReady) {
+          console.warn("⚠️ dbManager غير جاهز، لن يتم حفظ التغييرات محلياً");
+          return;
+        }
         const order = deliveryOrders.find((o) => o.id === orderId);
         if (!order) return;
         order.deliveryPersonnelName = value;
@@ -9160,6 +9145,10 @@
       }
 
       async function savePaymentMethodDirect(orderId, value) {
+        if (!dbManager || !dbManager.isReady) {
+          console.warn("⚠️ dbManager غير جاهز، لن يتم حفظ التغييرات محلياً");
+          return;
+        }
         const order = deliveryOrders.find((o) => o.id === orderId);
         if (!order) return;
         order.deliveryPaymentMethod = value;
@@ -9174,6 +9163,10 @@
       }
 
       async function markAsDeliveredComplete(orderId) {
+        if (!dbManager || !dbManager.isReady) {
+          console.warn("⚠️ dbManager غير جاهز، لن يتم حفظ التغييرات محلياً");
+          return;
+        }
         const order = deliveryOrders.find((o) => o.id === orderId);
         if (!order) return;
 
@@ -9409,10 +9402,14 @@
         return colors[method] || "#9E9E9E";
       }
 
-      // ==================== دوال الحفظ المباشر للدليفري ====================
-
       // حفظ طلب توصيل جديد (يستخدم عند إتمام البيع إذا كان نوع الطلب توصيل)
       async function saveDeliveryOrderOffline(orderData) {
+        if (!dbManager || !dbManager.isReady) {
+          console.error(
+            "❌ dbManager غير جاهز، لا يمكن حفظ طلب التوصيل محلياً",
+          );
+          return { success: false, error: "dbManager not ready" };
+        }
         const order = {
           id: orderData.id || `DEL_${Date.now()}`,
           ...orderData,
@@ -9440,6 +9437,13 @@
 
       // ==================== دالة تحديث حالة التوصيل (Offline-First) ====================
       async function updateDeliveryOrderStatusOffline(orderId, updates) {
+        if (!dbManager || !dbManager.isReady) {
+          showNotification(
+            "❌ dbManager غير جاهز، لا يمكن تحديث الطلب",
+            "error",
+          );
+          return { success: false };
+        }
         const index = deliveryOrders.findIndex((o) => o.id === orderId);
         if (index === -1) {
           showNotification("❌ الطلب غير موجود", "error");
@@ -9483,6 +9487,10 @@
       }
 
       async function updateDeliveryOrderComplete(orderId) {
+        if (!dbManager || !dbManager.isReady) {
+          console.warn("⚠️ dbManager غير جاهز، لن يتم حفظ التغييرات محلياً");
+          return;
+        }
         const order = deliveryOrders.find((o) => o.id === orderId);
         if (!order) return;
 
@@ -9939,18 +9947,31 @@
         printWindow.print();
       }
 
+      function checkForNewDay() {
+        const todayStr = getLocalDateString();
+        if (currentOperatingDate && todayStr !== currentOperatingDate) {
+          console.log("📅 تم اكتشاف يوم جديد: " + todayStr);
+          startNewDay();
+          if (typeof loadCashierData === "function") {
+            loadCashierData();
+          }
+          showNotification(
+            "📅 بدأ يوم عمل جديد، تم تصفير رقم الفاتورة",
+            "info",
+          );
+        }
+      }
+
       async function loadAdminData() {
         try {
           showNotification("🔄 جاري تحميل بيانات المدير...", "info");
 
-          // تحميل المبيعات باستخدام InvoiceManager (يدمج المحلي والسحابي)
           if (invoiceManager) {
             sales = await invoiceManager.loadInvoices();
           } else {
             sales = await DataManager.getSales();
           }
 
-          // تحميل باقي البيانات
           products = await DataManager.getProducts();
           expenses = await DataManager.getExpenses();
           categories = await DataManager.getCategories();
@@ -9959,10 +9980,9 @@
           users = await DataManager.getUsers();
           deliveryOrders = await loadMergedDeliveryOrders();
 
-          // تحديث واجهات المستخدم
           updateDashboard();
           loadAdminProducts();
-          loadAdminSales(); // بعد تحميل البيانات، يعرض الجدول
+          loadAdminSales();
           loadExpenses();
           loadCategories();
           loadEmployees();
@@ -9971,7 +9991,10 @@
 
           updateTime();
           setInterval(updateTime, 1000);
-          setInterval(checkForNewDay, 60000);
+          // التحقق من وجود الدالة قبل استدعائها
+          if (typeof checkForNewDay === "function") {
+            setInterval(checkForNewDay, 60000);
+          }
 
           showNotification("✅ تم تحميل بيانات المدير بنجاح", "success");
         } catch (error) {
@@ -10017,54 +10040,50 @@
       function updateDashboard() {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
 
+        // 1. فلترة المبيعات العادية (صالة، تيك أوت، استلام)
         const todaySales = sales.filter((s) => {
           const saleDate = new Date(s.date);
-          saleDate.setHours(0, 0, 0, 0);
-          return saleDate.getTime() === today.getTime();
+          return saleDate >= today && saleDate < tomorrow;
         });
 
-        const todayTotal = todaySales.reduce(
-          (sum, s) => sum + (s.finalTotal || s.total),
+        // 2. فلترة طلبات التوصيل
+        const todayDelivery = deliveryOrders.filter((d) => {
+          const orderDate = new Date(d.date);
+          return orderDate >= today && orderDate < tomorrow;
+        });
+
+        // 3. دمج جميع الطلبات
+        const allOrders = [...todaySales, ...todayDelivery];
+
+        // 4. حساب إجمالي المبيعات وعدد الطلبات
+        const totalSales = allOrders.reduce(
+          (sum, order) => sum + (order.finalTotal || order.total || 0),
           0,
         );
+        const totalOrders = allOrders.length;
 
+        // 5. المصاريف (كما هي)
         const todayExpenses = expenses.filter((e) => {
           const expenseDate = new Date(e.date);
-          expenseDate.setHours(0, 0, 0, 0);
-          return expenseDate.getTime() === today.getTime();
+          return expenseDate >= today && expenseDate < tomorrow;
         });
-
-        const todayExpensesTotal = todayExpenses.reduce(
+        const totalExpenses = todayExpenses.reduce(
           (sum, e) => sum + e.amount,
           0,
         );
 
+        // 6. تحديث الواجهة
         document.getElementById("dashboardTotalSales").textContent =
-          todayTotal.toFixed(2) + " جنيه";
+          totalSales.toFixed(2) + " جنيه";
         document.getElementById("dashboardTotalOrders").textContent =
-          todaySales.length;
+          totalOrders;
         document.getElementById("dashboardTotalProducts").textContent =
           products.length;
         document.getElementById("dashboardTotalExpenses").textContent =
-          todayExpensesTotal.toFixed(2) + " جنيه";
-      }
-
-      function checkForNewDay() {
-        const todayStr = getLocalDateString();
-        if (currentOperatingDate && todayStr !== currentOperatingDate) {
-          console.log("📅 تم اكتشاف يوم جديد: " + todayStr);
-          startNewDay();
-          if (typeof loadCashierData === "function") {
-            loadCashierData();
-          }
-          showNotification(
-            "📅 بدأ يوم عمل جديد، تم تصفير رقم الفاتورة",
-            "info",
-          );
-        }
+          totalExpenses.toFixed(2) + " جنيه";
       }
 
       // ==================== دوال إدارة المنتجات ====================
@@ -14541,78 +14560,63 @@
         }
       }
 
-      async function loadInvoicesOnStartup() {
-        try {
-          // تحميل الفواتير المحلية
-          const localInvoices = await dbManager.getAllInvoices();
-          const pendingCount = localInvoices.filter(
-            (i) => i.status === "pending",
-          ).length;
-
-          if (pendingCount > 0) {
-            showNotification(`📦 يوجد ${pendingCount} فاتورة معلقة`, "warning");
-          }
-
-          // دمج مع Firebase إذا كان متصلاً
-          if (navigator.onLine && invoiceManager) {
-            const allInvoices = await invoiceManager.loadInvoices();
-
-            // تحديث المتغير العام
-            sales = allInvoices;
-
-            // تحديث العرض
-            if (typeof updateTodayStats === "function") {
-              updateTodayStats();
-            }
-          } else {
-            sales = localInvoices;
-          }
-
-          console.log(`📊 تم تحميل ${sales.length} فاتورة`);
-        } catch (error) {
-          console.error("❌ خطأ في تحميل الفواتير:", error);
-        }
-      }
-
       async function recoverFallbackData() {
+        if (!dbManager) {
+          console.warn("⚠️ dbManager غير متاح، تخطي استرداد بيانات الطوارئ");
+          return;
+        }
+
         const keys = Object.keys(localStorage).filter((k) =>
           k.startsWith("kafta_fallback_invoice_"),
         );
+        if (keys.length === 0) {
+          console.log("✅ لا توجد بيانات طوارئ لاستردادها");
+          return;
+        }
 
-        if (keys.length > 0) {
-          console.log(`🆘 استرداد ${keys.length} فاتورة من الطوارئ...`);
-
-          for (const key of keys) {
-            try {
-              const invoice = JSON.parse(localStorage.getItem(key));
-              await dbManager.addInvoice(invoice);
-              localStorage.removeItem(key);
-            } catch (e) {
-              console.error("فشل استرداد:", key);
+        console.log(`🆘 استرداد ${keys.length} فاتورة من الطوارئ...`);
+        for (const key of keys) {
+          try {
+            const invoice = JSON.parse(localStorage.getItem(key));
+            if (!invoice.id) {
+              console.warn("⚠️ فاتورة بدون معرف، تخطي:", key);
+              continue;
             }
+            await dbManager.addInvoice(invoice);
+            localStorage.removeItem(key);
+            console.log(`✅ تم استرداد الفاتورة ${invoice.id}`);
+          } catch (e) {
+            console.error("❌ فشل استرداد:", key, e);
           }
         }
+        console.log("🏁 انتهى استرداد بيانات الطوارئ");
       }
 
       // ==================== التهيئة عند تحميل الصفحة ====================
       document.addEventListener("DOMContentLoaded", async () => {
-        // تهيئة نظام Offline
-        await initializeOfflineSystem();
+        // تهيئة نظام Offline باستخدام SQLite عبر IPC
+        const systemReady = await initializeOfflineSystem();
 
-        // استرداد بيانات الطوارئ
+        // استرداد بيانات الطوارئ (فقط إذا كان dbManager جاهزاً)
         await recoverFallbackData();
 
-        // تحميل الفواتير (بدلاً من loadInvoicesOnStartup القديمة)
+        // تحميل الفواتير (يدمج محلي + سحابي إذا أمكن)
         await refreshSalesData();
 
-        // بدء المزامنة إذا كان متصلاً
-        if (navigator.onLine) {
+        // بدء المزامنة فقط إذا كان النظام جاهزاً ومتصلاً
+        if (systemReady && navigator.onLine && syncManager) {
           syncManager.syncPendingInvoices();
           syncManager.syncPendingDeliveryOrders();
+        } else if (!systemReady) {
+          console.warn(
+            "⚠️ نظام التخزين المحلي غير جاهز، لن تتم المزامنة التلقائية",
+          );
         }
 
         // باقي التهيئة...
         const today = getLocalDateString();
+
+        // تعيين التواريخ الافتراضية
         const expenseDateInput = document.getElementById("expenseDate");
         if (expenseDateInput) {
           expenseDateInput.value = today;
@@ -14671,19 +14675,22 @@
             select.innerHTML = '<option value="all">جميع الموصلين</option>';
         });
 
+        // تحميل بيانات الدليفري المحفوظة في localStorage (كحل احتياطي)
         try {
           const savedDeliveryOrders = localStorage.getItem(
             "kafta_delivery_orders",
           );
           if (savedDeliveryOrders)
             deliveryOrders = JSON.parse(savedDeliveryOrders);
-
           const savedPersonnel = localStorage.getItem(
             "kafta_delivery_personnel",
           );
           if (savedPersonnel) deliveryPersonnel = JSON.parse(savedPersonnel);
         } catch (error) {
-          console.error("❌ خطأ في تحميل بيانات الدليفري:", error);
+          console.error(
+            "❌ خطأ في تحميل بيانات الدليفري من localStorage:",
+            error,
+          );
         }
 
         window.addEventListener("online", () => updateConnectionStatus(true));
@@ -15351,6 +15358,7 @@
 
       // ==================== دوال تقارير الكاشير (مكتملة) ====================
 
+      // تعريف دالة موحدة لتحويل نوع الطلب
       function getOrderTypeName(type) {
         const types = {
           hall: "صالة",
@@ -15361,8 +15369,8 @@
         return types[type] || type;
       }
 
+      // تعريف دالة موحدة لتحويل طريقة الدفع
       function getPaymentMethodName(method) {
-        if (!method) return "غير محدد";
         const methods = {
           cash: "كاش",
           bank: "بنكك",
@@ -15411,7 +15419,7 @@
 
         if (filteredSales.length === 0) {
           tbody.innerHTML =
-            '<tr><td colspan="9" style="text-align: center; padding: 20px;">لا توجد مبيعات في هذه الفترة</td></tr>';
+            '<tr><td colspan="10" style="text-align: center; padding: 20px;">لا توجد مبيعات في هذه الفترة</td></tr>';
         } else {
           tbody.innerHTML = filteredSales
             .map((sale) => {
@@ -15434,29 +15442,45 @@
                 2,
               );
 
+              // بناء نص المنتجات المختصر
+              let productsText = "";
+              if (sale.items && sale.items.length) {
+                const itemsList = sale.items
+                  .map((item) => `${item.name} (${item.quantity})`)
+                  .join("، ");
+                productsText =
+                  itemsList.length > 50
+                    ? itemsList.substring(0, 47) + "..."
+                    : itemsList;
+              } else {
+                productsText = "-";
+              }
+
               return `
-                      <tr>
-                          <td style="font-weight: bold;">${invoiceNumber}</td>
-                          <td>${date}</td>
-                          <td>${time}</td>
-                          <td>${orderTypeName}</td>
-                          <td>${paymentName}</td>
-                          <td>${itemsCount}</td>
-                          <td style="color: var(--secondary-color); font-weight: bold;">${finalTotal} جنيه</td>
-                          <td>
-                              <button class="btn btn-info" onclick="showInvoiceModal('${sale.id}')" style="padding: 5px 10px; font-size: 12px; background: #2196F3; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 5px;">
-                                  <i class="fas fa-eye"></i>
-                              </button>
-                              <button class="btn btn-print" onclick="printSingleInvoice('${sale.id}')" style="padding: 5px 10px; font-size: 12px; background: #607D8B; color: white; border: none; border-radius: 5px; cursor: pointer;">
-                                  <i class="fas fa-print"></i>
-                              </button>
-                          </td>
-                      </tr>
-                  `;
+          <tr>
+            <td style="font-weight: bold;">${invoiceNumber}</td>
+            <td>${date}</td>
+            <td>${time}</td>
+            <td>${orderTypeName}</td>
+            <td>${paymentName}</td>
+            <td style="max-width: 200px; white-space: normal; word-break: break-word;" title="${productsText}">${productsText}</td>
+            <td>${itemsCount}</td>
+            <td style="color: var(--secondary-color); font-weight: bold;">${finalTotal} جنيه</td>
+            <td>
+              <button class="btn btn-info" onclick="showInvoiceModal('${sale.id}')" style="padding: 5px 10px; font-size: 12px; background: #2196F3; color: white; border: none; border-radius: 5px; cursor: pointer; margin-left: 5px;">
+                <i class="fas fa-eye"></i> تفاصيل
+              </button>
+              <button class="btn btn-print" onclick="printSingleInvoice('${sale.id}')" style="padding: 5px 10px; font-size: 12px; background: #607D8B; color: white; border: none; border-radius: 5px; cursor: pointer;">
+                <i class="fas fa-print"></i> طباعة
+              </button>
+            </td>
+          </tr>
+        `;
             })
             .join("");
         }
 
+        // عرض المصاريف
         const expensesTbody = document.getElementById(
           "cashierExpensesTableBody",
         );
@@ -15477,18 +15501,19 @@
                     })
                   : "----";
                 return `
-                          <tr>
-                              <td>${date}</td>
-                              <td>${time}</td>
-                              <td>${expense.description || "-"}</td>
-                              <td style="color: var(--error-color); font-weight: bold;">${expense.amount.toFixed(2)} جنيه</td>
-                          </tr>
-                      `;
+            <tr>
+              <td>${date}</td>
+              <td>${time}</td>
+              <td>${expense.description || "-"}</td>
+              <td style="color: var(--error-color); font-weight: bold;">${expense.amount.toFixed(2)} جنيه</td>
+            </tr>
+          `;
               })
               .join("");
           }
         }
 
+        // تحديث المنتجات الأكثر مبيعاً
         if (topProductsBody) {
           updateCashierTopProducts(filteredSales);
         }
